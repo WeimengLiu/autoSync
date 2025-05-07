@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文件同步任务管理</title>
+    <link href="{{ url_for('static', filename='css/bootstrap.min.css') }}" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/bootstrap-icons.css') }}" rel="stylesheet">
+    <style>
+        body {
+            background-color: #f8f9fa;
+        }
+        .task-card {
+            margin-bottom: 1rem;
+            transition: transform 0.2s;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .task-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        .log-container {
+            height: 400px;
+            overflow-y: auto;
+            background-color: #1e1e1e;
+            color: #fff;
+            padding: 1rem;
+            font-family: 'Consolas', monospace;
+            border-radius: 4px;
+        }
+        .status-badge {
+            font-size: 0.9rem;
+            padding: 0.4rem 0.8rem;
+        }
+        .btn-group {
+            gap: 0.5rem;
+        }
+        .btn {
+            border-radius: 4px;
+        }
+        .card-title {
+            color: #0d6efd;
+            font-weight: 600;
+        }
+        .card-text {
+            color: #6c757d;
+        }
+        .form-label {
+            font-weight: 500;
+        }
+        .modal-header {
+            background-color: #f8f9fa;
+            border-bottom: 1px solid #dee2e6;
+        }
+        .modal-footer {
+            background-color: #f8f9fa;
+            border-top: 1px solid #dee2e6;
+        }
+        .page-header {
+            background-color: #fff;
+            padding: 2rem 0;
+            margin-bottom: 2rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .task-info {
+            font-size: 0.9rem;
+            min-height: 120px;
+        }
+        .task-info strong {
+            color: #495057;
+        }
+    </style>
+</head>
+<body>
+    <div class="page-header">
+        <div class="container">
+            <div class="d-flex justify-content-between align-items-center">
+                <h1 class="mb-0">文件同步任务管理</h1>
+                <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addTaskModal">
+                    <i class="bi bi-plus-circle"></i> 添加新任务
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- 任务列表 -->
+        <div id="taskList" class="row"></div>
+
+        <!-- 添加任务模态框 -->
+        <div class="modal fade" id="addTaskModal" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-plus-circle"></i> 添加新任务</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <form id="addTaskForm">
+                            <div class="mb-3">
+                                <label class="form-label">任务名称</label>
+                                <input type="text" class="form-control" name="name" required>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">输入目录</label>
+                                <input type="text" class="form-control" name="input_dir" required>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">输出目录</label>
+                                <input type="text" class="form-control" name="output_dir" required>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">文件后缀（用逗号分隔）</label>
+                                <input type="text" class="form-control" name="extensions" value="jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup" required>
+                                <div class="form-text">默认值包含图片和字幕文件格式</div>
+                            </div>
+                        </form>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                        <button type="button" class="btn btn-primary" onclick="addTask()">
+                            <i class="bi bi-check-circle"></i> 添加
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 编辑任务模态框 -->
+        <div class="modal fade" id="editTaskModal" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-pencil-square"></i> 编辑任务</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <form id="editTaskForm">
+                            <input type="hidden" name="task_id">
+                            <div class="mb-3">
+                                <label class="form-label">任务名称</label>
+                                <input type="text" class="form-control" name="name" required>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">输入目录</label>
+                                <input type="text" class="form-control" name="input_dir" required>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">输出目录</label>
+                                <input type="text" class="form-control" name="output_dir" required>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">文件后缀（用逗号分隔）</label>
+                                <input type="text" class="form-control" name="extensions" value="jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup" required>
+                                <div class="form-text">默认值包含图片和字幕文件格式</div>
+                            </div>
+                        </form>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                        <button type="button" class="btn btn-primary" onclick="updateTask()">
+                            <i class="bi bi-check-circle"></i> 保存
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 日志模态框 -->
+        <div class="modal fade" id="logModal" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-journal-text"></i> 任务日志</h5>
+                        <div class="ms-auto">
+                            <select id="logDateSelect" class="form-select form-select-sm" style="width: 150px;">
+                                <option value="">加载中...</option>
+                            </select>
+                        </div>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div id="logContainer" class="log-container"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/bootstrap.bundle.min.js') }}"></script>
+    <script>
+        // 加载任务列表
+        function loadTasks() {
+            fetch('/api/tasks')
+                .then(response => response.json())
+                .then(tasks => {
+                    const taskList = document.getElementById('taskList');
+                    taskList.innerHTML = '';
+                    tasks.forEach(task => {
+                        const card = createTaskCard(task);
+                        taskList.appendChild(card);
+                    });
+                });
+        }
+
+        // 创建任务卡片
+        function createTaskCard(task) {
+            const col = document.createElement('div');
+            col.className = 'col-md-6';
+            col.innerHTML = `
+                <div class="card task-card" data-task-id="${task.task_id}">
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between align-items-start mb-3">
+                            <h5 class="card-title">${task.name}</h5>
+                            <span class="badge ${task.status === 'running' ? 'bg-success' : 'bg-secondary'} status-badge">
+                                ${task.status === 'running' ? '运行中' : '已停止'}
+                            </span>
+                        </div>
+                        <div class="task-info mb-3">
+                            <p class="mb-2"><strong>输入目录:</strong> ${task.input_dir}</p>
+                            <p class="mb-2"><strong>输出目录:</strong> ${task.output_dir}</p>
+                            <p class="mb-2"><strong>文件后缀:</strong> ${task.extensions}</p>
+                            <p class="mb-2"><strong>启动时间:</strong> ${task.start_time || '-'}</p>
+                            <p class="mb-2"><strong>停止时间:</strong> ${task.stop_time || '-'}</p>
+                        </div>
+                        <div class="btn-group">
+                            ${task.status === 'running' 
+                                ? `<button class="btn btn-warning" onclick="stopTask('${task.task_id}')">
+                                    <i class="bi bi-stop-circle"></i> 停止
+                                   </button>`
+                                : `<button class="btn btn-success" onclick="startTask('${task.task_id}')">
+                                    <i class="bi bi-play-circle"></i> 启动
+                                   </button>`
+                            }
+                            <button class="btn btn-info" onclick="showLogs('${task.task_id}')">
+                                <i class="bi bi-journal-text"></i> 查看日志
+                            </button>
+                            <button class="btn btn-primary" onclick="showEditModal('${task.task_id}')">
+                                <i class="bi bi-pencil-square"></i> 编辑
+                            </button>
+                            <button class="btn btn-danger" onclick="removeTask('${task.task_id}')">
+                                <i class="bi bi-trash"></i> 删除
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            return col;
+        }
+
+        // 添加任务
+        function addTask() {
+            const form = document.getElementById('addTaskForm');
+            const data = {
+                name: form.name.value,
+                input_dir: form.input_dir.value,
+                output_dir: form.output_dir.value,
+                extensions: form.extensions.value
+            };
+
+            fetch('/api/tasks', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(() => {
+                bootstrap.Modal.getInstance(document.getElementById('addTaskModal')).hide();
+                loadTasks();
+            });
+        }
+
+        // 删除任务
+        function removeTask(taskId) {
+            if (confirm('确定要删除这个任务吗？')) {
+                fetch(`/api/tasks/${taskId}`, {
+                    method: 'DELETE'
+                })
+                .then(response => response.json())
+                .then(() => loadTasks());
+            }
+        }
+
+        // 启动任务
+        function startTask(taskId) {
+            const card = document.querySelector(`.card[data-task-id="${taskId}"]`);
+            if (!card) {
+                console.error('找不到任务卡片:', taskId);
+                return;
+            }
+            const startBtn = card.querySelector('.btn-success');
+            const stopBtn = card.querySelector('.btn-warning');
+            
+            if (!startBtn) {
+                console.error('找不到启动按钮:', taskId);
+                return;
+            }
+
+            // 禁用按钮并显示加载状态
+            startBtn.disabled = true;
+            startBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 启动中...';
+            if (stopBtn) {
+                stopBtn.disabled = true;
+            }
+
+            fetch(`/api/tasks/${taskId}/start`, {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    // 立即更新UI状态
+                    const statusBadge = card.querySelector('.status-badge');
+                    if (statusBadge) {
+                        statusBadge.className = 'badge bg-success status-badge';
+                        statusBadge.textContent = '运行中';
+                    }
+                    
+                    // 立即更新按钮
+                    const btnGroup = card.querySelector('.btn-group');
+                    if (btnGroup) {
+                        btnGroup.innerHTML = `
+                            <button class="btn btn-warning" onclick="stopTask('${taskId}')">
+                                <i class="bi bi-stop-circle"></i> 停止
+                            </button>
+                            <button class="btn btn-info" onclick="showLogs('${taskId}')">
+                                <i class="bi bi-journal-text"></i> 查看日志
+                            </button>
+                            <button class="btn btn-primary" onclick="showEditModal('${taskId}')">
+                                <i class="bi bi-pencil-square"></i> 编辑
+                            </button>
+                            <button class="btn btn-danger" onclick="removeTask('${taskId}')">
+                                <i class="bi bi-trash"></i> 删除
+                            </button>
+                        `;
+                    }
+                    
+                    // 刷新任务列表
+                    loadTasks();
+                } else {
+                    alert('启动任务失败: ' + data.message);
+                    // 恢复按钮状态
+                    startBtn.disabled = false;
+                    startBtn.innerHTML = '<i class="bi bi-play-circle"></i> 启动';
+                    if (stopBtn) {
+                        stopBtn.disabled = false;
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('启动任务失败');
+                // 恢复按钮状态
+                startBtn.disabled = false;
+                startBtn.innerHTML = '<i class="bi bi-play-circle"></i> 启动';
+                if (stopBtn) {
+                    stopBtn.disabled = false;
+                }
+            });
+        }
+
+        // 停止任务
+        function stopTask(taskId) {
+            const card = document.querySelector(`.card[data-task-id="${taskId}"]`);
+            if (!card) {
+                console.error('找不到任务卡片:', taskId);
+                return;
+            }
+            const startBtn = card.querySelector('.btn-success');
+            const stopBtn = card.querySelector('.btn-warning');
+            
+            if (!stopBtn) {
+                console.error('找不到停止按钮:', taskId);
+                return;
+            }
+
+            // 禁用按钮并显示加载状态
+            stopBtn.disabled = true;
+            stopBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 停止中...';
+            if (startBtn) {
+                startBtn.disabled = true;
+            }
+
+            fetch(`/api/tasks/${taskId}/stop`, {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    // 立即更新UI状态
+                    const statusBadge = card.querySelector('.status-badge');
+                    if (statusBadge) {
+                        statusBadge.className = 'badge bg-secondary status-badge';
+                        statusBadge.textContent = '已停止';
+                    }
+                    
+                    // 立即更新按钮
+                    const btnGroup = card.querySelector('.btn-group');
+                    if (btnGroup) {
+                        btnGroup.innerHTML = `
+                            <button class="btn btn-success" onclick="startTask('${taskId}')">
+                                <i class="bi bi-play-circle"></i> 启动
+                            </button>
+                            <button class="btn btn-info" onclick="showLogs('${taskId}')">
+                                <i class="bi bi-journal-text"></i> 查看日志
+                            </button>
+                            <button class="btn btn-primary" onclick="showEditModal('${taskId}')">
+                                <i class="bi bi-pencil-square"></i> 编辑
+                            </button>
+                            <button class="btn btn-danger" onclick="removeTask('${taskId}')">
+                                <i class="bi bi-trash"></i> 删除
+                            </button>
+                        `;
+                    }
+                    
+                    // 刷新任务列表
+                    loadTasks();
+                } else {
+                    alert('停止任务失败: ' + data.message);
+                    // 恢复按钮状态
+                    stopBtn.disabled = false;
+                    stopBtn.innerHTML = '<i class="bi bi-stop-circle"></i> 停止';
+                    if (startBtn) {
+                        startBtn.disabled = false;
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('停止任务失败');
+                // 恢复按钮状态
+                stopBtn.disabled = false;
+                stopBtn.innerHTML = '<i class="bi bi-stop-circle"></i> 停止';
+                if (startBtn) {
+                    startBtn.disabled = false;
+                }
+            });
+        }
+
+        // 显示编辑模态框
+        function showEditModal(taskId) {
+            fetch(`/api/tasks/${taskId}`)
+                .then(response => response.json())
+                .then(task => {
+                    const form = document.getElementById('editTaskForm');
+                    form.task_id.value = task.task_id;
+                    form.name.value = task.name;
+                    form.input_dir.value = task.input_dir;
+                    form.output_dir.value = task.output_dir;
+                    form.extensions.value = task.extensions;
+                    new bootstrap.Modal(document.getElementById('editTaskModal')).show();
+                });
+        }
+
+        // 更新任务
+        function updateTask() {
+            const form = document.getElementById('editTaskForm');
+            const taskId = form.task_id.value;
+            const data = {
+                name: form.name.value,
+                input_dir: form.input_dir.value,
+                output_dir: form.output_dir.value,
+                extensions: form.extensions.value
+            };
+
+            fetch(`/api/tasks/${taskId}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(() => {
+                bootstrap.Modal.getInstance(document.getElementById('editTaskModal')).hide();
+                loadTasks();
+            });
+        }
+
+        // 显示日志
+        function showLogs(taskId) {
+            const logContainer = document.getElementById('logContainer');
+            const dateSelect = document.getElementById('logDateSelect');
+            logContainer.innerHTML = '加载中...';
+            new bootstrap.Modal(document.getElementById('logModal')).show();
+
+            // 加载可用的日志日期
+            fetch(`/api/tasks/${taskId}/log_dates`)
+                .then(response => response.json())
+                .then(data => {
+                    dateSelect.innerHTML = '';
+                    const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+                    let foundToday = false;
+                    
+                    data.dates.forEach(date => {
+                        const option = document.createElement('option');
+                        option.value = date;
+                        // 格式化日期显示：YYYY-MM-DD
+                        const formattedDate = `${date.substring(0, 4)}-${date.substring(4, 6)}-${date.substring(6, 8)}`;
+                        option.textContent = formattedDate;
+                        dateSelect.appendChild(option);
+                        
+                        // 检查是否有今天的日志
+                        if (date === today) {
+                            foundToday = true;
+                        }
+                    });
+                    
+                    // 如果有今天的日志，默认选择今天
+                    if (foundToday) {
+                        dateSelect.value = today;
+                        loadLogs(taskId, today);
+                    } else if (data.dates.length > 0) {
+                        // 否则选择最新的日志日期
+                        dateSelect.value = data.dates[0];
+                        loadLogs(taskId, data.dates[0]);
+                    }
+                });
+
+            // 监听日期选择变化
+            dateSelect.addEventListener('change', () => {
+                loadLogs(taskId, dateSelect.value);
+            });
+        }
+
+        // 加载指定日期的日志
+        function loadLogs(taskId, date) {
+            const logContainer = document.getElementById('logContainer');
+            logContainer.innerHTML = '加载中...';
+
+            fetch(`/api/tasks/${taskId}/logs?date=${date}`)
+                .then(response => response.json())
+                .then(data => {
+                    logContainer.innerHTML = data.logs.join('<br>');
+                    logContainer.scrollTop = logContainer.scrollHeight;
+                });
+        }
+
+        // 定期刷新任务列表
+        setInterval(loadTasks, 5000);
+
+        // 初始加载
+        loadTasks();
+    </script>
+</body>
+</html> 

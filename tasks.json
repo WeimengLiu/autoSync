@@ -1,0 +1,22 @@
+[
+  {
+    "task_id": "1745909256",
+    "name": "test",
+    "input_dir": "/Users/wmliu/tmp/source",
+    "output_dir": "/Users/wmliu/tmp/target",
+    "extensions": "jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup",
+    "status": "stopped",
+    "start_time": "2025-05-07 15:19:53",
+    "stop_time": "2025-05-07 15:21:48"
+  },
+  {
+    "task_id": "1745917067",
+    "name": "test2",
+    "input_dir": "/Users/wmliu/tmp/source1",
+    "output_dir": "/Users/wmliu/tmp/target1",
+    "extensions": "jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup",
+    "status": "stopped",
+    "start_time": "2025-04-29 17:51:01",
+    "stop_time": "2025-04-29 17:51:10"
+  }
+]
