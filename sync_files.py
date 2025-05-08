@@ -8,7 +8,16 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 from watchdog.observers import Observer
-from watchdog.observers.fsevents import FSEventsObserver  # macOS 专用观察者
+# 有条件地导入FSEventsObserver
+import sys
+if sys.platform == 'darwin':  # 仅在macOS上导入
+    try:
+        from watchdog.observers.fsevents import FSEventsObserver  # macOS 专用观察者
+    except ImportError:
+        FSEventsObserver = None
+else:
+    FSEventsObserver = None
+    
 from watchdog.events import (
     FileSystemEventHandler,
     FileClosedEvent,
@@ -28,7 +37,6 @@ from typing import Dict, Set, Deque
 import time
 import threading
 from cache_manager import CacheManager
-import sys
 
 # 配置常量
 DEFAULT_EXTENSIONS = "jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup"
@@ -171,8 +179,12 @@ class FileSyncHandler(FileSystemEventHandler):
 
             if file_size >= LARGE_FILE_THRESHOLD:
                 with open(file_path, 'rb') as f:
-                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                        md5_hash.update(mm)
+                    if file_size > 0:  # 确保文件不为空
+                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                            md5_hash.update(mm)
+                    else:  # 空文件特殊处理
+                        self.logger.debug(f"空文件特殊处理: {file_path}")
+                        pass  # 空文件的MD5就是空字符串的MD5
             else:
                 async with aiofiles.open(file_path, 'rb') as f:
                     while chunk := await f.read(8192):
@@ -204,19 +216,28 @@ class FileSyncHandler(FileSystemEventHandler):
             if self.check_extension(input_path):
                 # 处理需要复制的文件
                 try:
-                    # 获取源文件的MD5和大小
+                    # 获取源文件大小
                     source_size = os.path.getsize(input_path)
-                    source_md5 = await self.get_file_md5_async(input_path)
-                    if source_md5 is None:
-                        raise Exception("无法计算源文件MD5")
-
-                    # 如果目标文件已存在，检查是否需要更新
-                    if Path(output_path).exists():
+                    
+                    # 如果是全量同步模式且目标文件已存在，只比较文件大小
+                    if event_type == "initial" and Path(output_path).exists():
                         target_size = os.path.getsize(output_path)
                         if target_size == source_size:
-                            target_md5 = await self.get_file_md5_async(output_path)
-                            if target_md5 == source_md5:
-                                return
+                            # 文件大小相同，跳过MD5检查
+                            return
+                    else:
+                        # 如果不是全量同步，或者文件不存在，则需要计算MD5
+                        source_md5 = await self.get_file_md5_async(input_path)
+                        if source_md5 is None:
+                            raise Exception("无法计算源文件MD5")
+
+                        # 检查是否需要更新
+                        if Path(output_path).exists():
+                            target_size = os.path.getsize(output_path)
+                            if target_size == source_size:
+                                target_md5 = await self.get_file_md5_async(output_path)
+                                if target_md5 == source_md5:
+                                    return
 
                     # 开始复制文件
                     temp_output_path = output_path + '.tmp'
@@ -230,8 +251,11 @@ class FileSyncHandler(FileSystemEventHandler):
                         # 直接计算临时文件的 MD5，不使用缓存
                         temp_md5_hash = hashlib.md5()
                         with open(temp_output_path, 'rb') as f:
-                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                                temp_md5_hash.update(mm)
+                            if temp_size > 0:  # 确保文件不为空
+                                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                                    temp_md5_hash.update(mm)
+                            else:  # 空文件特殊处理
+                                self.logger.debug(f"空文件特殊处理: {temp_output_path}")
                         temp_md5 = temp_md5_hash.hexdigest()
                         
                         if temp_size != source_size or temp_md5 != source_md5:
@@ -486,6 +510,10 @@ async def sync_all_files(input_dir: str, output_dir: str, extensions: str, logge
     processed_paths = set()
     processed_files = 0
     
+    # 设置进度报告的间隔（约5%）
+    progress_interval = max(1, int(total_files * 0.05))
+    last_reported_progress = 0
+    
     # 同步文件并处理软链接
     for root, _, files in os.walk(input_dir):
         for file in files:
@@ -496,8 +524,13 @@ async def sync_all_files(input_dir: str, output_dir: str, extensions: str, logge
             try:
                 await handler.sync_file_async(input_path, "initial")
                 processed_files += 1
-                if processed_files % 10 == 0:
-                    logger.info(f"[进度] {processed_files}/{total_files} ({processed_files/total_files*100:.1f}%)")
+                
+                # 使用百分比间隔显示进度
+                current_progress = processed_files // progress_interval
+                if current_progress > last_reported_progress:
+                    progress_percentage = (processed_files / total_files) * 100
+                    logger.info(f"[进度] {processed_files}/{total_files} ({progress_percentage:.1f}%)")
+                    last_reported_progress = current_progress
             except Exception as e:
                 logger.error(f"[错误] {Path(input_path).relative_to(input_dir)}: {e}")
     
@@ -579,11 +612,12 @@ def main():
     logger.info("全量同步完成")
 
     # 启动文件监控，使用FSEventsObserver来支持文件关闭事件
-    if sys.platform == 'darwin':  # macOS
+    if sys.platform == 'darwin' and FSEventsObserver is not None:  # macOS且成功导入
         observer = FSEventsObserver()
-    else:  # 其他平台
+        logger.info("使用macOS原生FSEventsObserver")
+    else:  # 其他平台或导入失败
         observer = Observer()
-        logger.warning("当前平台不支持文件关闭事件监听，将使用修改事件代替")
+        logger.warning("使用标准Observer，不支持文件关闭事件监听，将使用修改事件代替")
 
     event_handler = FileSyncHandler(args.input_dir, args.output_dir, args.extensions, logger)
     observer.schedule(event_handler, args.input_dir, recursive=True)

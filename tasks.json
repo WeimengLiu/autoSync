@@ -5,8 +5,8 @@
     "input_dir": "/Users/wmliu/tmp/source",
     "output_dir": "/Users/wmliu/tmp/target",
     "extensions": "jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup",
-    "status": "running",
-    "start_time": "2025-05-08 15:59:56",
-    "stop_time": null
+    "status": "stopped",
+    "start_time": "2025-05-08 19:05:20",
+    "stop_time": "2025-05-08 19:05:57"
   }
 ]

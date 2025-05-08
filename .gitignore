@@ -49,3 +49,6 @@ cache/
 *.bak
 *.swp
 *~ 
+
+.db
+*.db
