@@ -3,9 +3,11 @@ import os
 import json
 import time
 import threading
+import asyncio
 from datetime import datetime
 from pathlib import Path
-import pyinotify
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler, FileClosedEvent
 from sync_files import FileSyncHandler, setup_logger, sync_all_files, cleanup_empty_dirs
 
 class TaskRunner:
@@ -16,14 +18,16 @@ class TaskRunner:
         self.output_dir = output_dir
         self.extensions = extensions
         self.status = "stopped"
-        self.notifier = None
+        self.observer = None
         self.handler = None
         self.thread = None
-        self.logger = None
         self.start_time = None
         self.stop_time = None
         self._running = False
         self._lock = threading.Lock()
+        
+        # 初始化logger
+        self.logger = setup_logger(verbose=True, task_id=self.task_id)
 
     def to_dict(self):
         return {
@@ -41,18 +45,16 @@ class TaskRunner:
         """在独立线程中运行任务"""
         try:
             # 设置日志
-            self.logger = setup_logger(task_id=self.task_id, verbose=True)
             self.logger.info("任务 %s 启动", self.name)
 
             # 创建输出目录
             os.makedirs(self.output_dir, exist_ok=True)
 
             # 初始全量同步
-            sync_all_files(self.input_dir, self.output_dir, self.extensions, self.logger)
+            asyncio.run(sync_all_files(self.input_dir, self.output_dir, self.extensions, self.logger))
             cleanup_empty_dirs(self.output_dir, self.logger)
 
             # 创建事件处理器
-            wm = pyinotify.WatchManager()
             self.handler = FileSyncHandler(
                 self.input_dir,
                 self.output_dir,
@@ -60,46 +62,38 @@ class TaskRunner:
                 self.logger
             )
 
-            # 创建通知器
-            self.notifier = pyinotify.Notifier(wm, self.handler)
-            
-            # 添加监控，只监控指定的事件
-            mask = (pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO | 
-                   pyinotify.IN_DELETE | pyinotify.IN_MOVED_FROM | 
-                   pyinotify.IN_DELETE_SELF)
-            self.logger.info("开始添加目录监控: %s", self.input_dir)
-            wdd = wm.add_watch(self.input_dir, mask, rec=True, auto_add=True)
-            
-            # 检查监控是否成功添加
-            if not wdd:
-                self.logger.error("添加目录监控失败")
-                return
-            else:
-                self.logger.info("成功添加监控的目录: %s", list(wdd.keys()))
+            # 启动事件循环
+            loop_thread = threading.Thread(target=self._run_event_loop, args=(self.handler.event_loop,))
+            loop_thread.daemon = True
+            loop_thread.start()
 
+            # 创建观察者
+            self.observer = Observer()
+            self.observer.schedule(self.handler, self.input_dir, recursive=True)
+            self.observer.start()
+            
             self.logger.info("开始监控目录变化...")
             self._running = True
             
-            # 使用 check_events 和 read_events 的方式处理事件
+            # 保持线程运行
             while self._running:
-                try:
-                    # 检查是否有新事件，设置1秒超时
-                    if self.notifier.check_events(timeout=1000):
-                        # 读取并处理所有待处理的事件
-                        self.notifier.read_events()
-                        self.notifier.process_events()
-                except Exception as e:
-                    self.logger.error("处理事件时出错: %s", str(e))
+                time.sleep(1)
 
         except Exception as e:
             self.logger.error("任务运行出错: %s", str(e))
         finally:
-            if self.notifier:
-                self.notifier.stop()
+            if self.observer:
+                self.observer.stop()
+                self.observer.join()
             self._running = False
             with self._lock:
                 self.status = "stopped"
                 self.stop_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _run_event_loop(self, loop):
+        """运行事件循环"""
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
 
     def start(self):
         with self._lock:
@@ -138,8 +132,12 @@ class TaskRunner:
                     self.logger.info("开始停止任务 %s", self.name)
                 self._running = False  # 设置停止标志
                 
-                if self.notifier:
-                    self.notifier.stop()
+                if self.observer:
+                    self.observer.stop()
+                    self.observer.join()
+                
+                if self.handler and hasattr(self.handler, 'event_loop'):
+                    self.handler.event_loop.call_soon_threadsafe(self.handler.event_loop.stop)
                 
                 if self.thread and self.thread.is_alive():
                     self.thread.join(timeout=5)  # 等待线程结束
@@ -147,7 +145,7 @@ class TaskRunner:
                         if self.logger:
                             self.logger.warning("任务 %s 线程仍在运行，强制终止", self.name)
                 
-                self.notifier = None
+                self.observer = None
                 self.handler = None
                 self.thread = None
 

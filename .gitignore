@@ -42,6 +42,7 @@ config.json
 .coverage
 htmlcov/
 cache/
+.cache/
 
 # 临时文件
 *.tmp

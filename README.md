@@ -104,4 +104,222 @@ nfo, srt, ass, ssa, sub, idx, smi, ssa, SRT, sup
 
 ## 许可证
 
-本项目基于 MIT 许可证开源，详见 [LICENSE](LICENSE) 文件。 
+本项目基于 MIT 许可证开源，详见 [LICENSE](LICENSE) 文件。
+
+## 生产环境部署
+
+### 1. 使用 Supervisor 管理进程
+
+1. 安装 Supervisor：
+```bash
+# Ubuntu/Debian
+sudo apt-get install supervisor
+
+# CentOS/RHEL
+sudo yum install supervisor
+```
+
+2. 创建配置文件 `/etc/supervisor/conf.d/autosync.conf`：
+```ini
+[program:autosync]
+directory=/path/to/autoSync
+command=/path/to/venv/bin/python app.py
+user=your_user
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/autosync/err.log
+stdout_logfile=/var/log/autosync/out.log
+environment=PYTHONUNBUFFERED=1
+
+[supervisord]
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+childlogdir=/var/log/supervisor
+```
+
+3. 创建日志目录：
+```bash
+sudo mkdir -p /var/log/autosync
+sudo chown your_user:your_user /var/log/autosync
+```
+
+4. 启动服务：
+```bash
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl start autosync
+```
+
+### 2. 使用 Nginx 反向代理
+
+1. 安装 Nginx：
+```bash
+# Ubuntu/Debian
+sudo apt-get install nginx
+
+# CentOS/RHEL
+sudo yum install nginx
+```
+
+2. 创建 Nginx 配置文件 `/etc/nginx/conf.d/autosync.conf`：
+```nginx
+server {
+    listen 80;
+    server_name your_domain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:5001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 用于处理大文件上传
+    client_max_body_size 100M;
+    
+    # 安全相关配置
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-XSS-Protection "1; mode=block";
+    add_header X-Content-Type-Options "nosniff";
+}
+```
+
+3. 测试并重启 Nginx：
+```bash
+sudo nginx -t
+sudo systemctl restart nginx
+```
+
+### 3. 系统服务配置
+
+1. 创建系统服务文件 `/etc/systemd/system/autosync.service`：
+```ini
+[Unit]
+Description=AutoSync File Synchronization Service
+After=network.target
+
+[Service]
+Type=simple
+User=your_user
+Group=your_user
+WorkingDirectory=/path/to/autoSync
+Environment="PATH=/path/to/venv/bin"
+ExecStart=/path/to/venv/bin/python app.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+2. 启用并启动服务：
+```bash
+sudo systemctl enable autosync
+sudo systemctl start autosync
+```
+
+### 4. 安全配置
+
+1. 配置防火墙：
+```bash
+# Ubuntu/Debian (UFW)
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+
+# CentOS/RHEL (firewalld)
+sudo firewall-cmd --permanent --add-service=http
+sudo firewall-cmd --permanent --add-service=https
+sudo firewall-cmd --reload
+```
+
+2. 设置文件权限：
+```bash
+# 设置应用目录权限
+sudo chown -R your_user:your_user /path/to/autoSync
+sudo chmod -R 755 /path/to/autoSync
+
+# 设置日志目录权限
+sudo chown -R your_user:your_user /var/log/autosync
+sudo chmod -R 755 /var/log/autosync
+```
+
+### 5. 监控和维护
+
+1. 日志轮转配置 `/etc/logrotate.d/autosync`：
+```
+/var/log/autosync/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 your_user your_user
+}
+```
+
+2. 监控命令：
+```bash
+# 查看服务状态
+sudo systemctl status autosync
+
+# 查看日志
+sudo journalctl -u autosync
+
+# 查看 Supervisor 状态
+sudo supervisorctl status
+
+# 查看 Nginx 访问日志
+tail -f /var/log/nginx/access.log
+```
+
+### 6. 备份策略
+
+1. 备份数据：
+```bash
+# 创建备份脚本 backup.sh
+#!/bin/bash
+BACKUP_DIR="/path/to/backups"
+DATE=$(date +%Y%m%d)
+tar -czf "$BACKUP_DIR/autosync_$DATE.tar.gz" \
+    -C /path/to/autoSync \
+    --exclude="*.pyc" \
+    --exclude="__pycache__" \
+    --exclude="logs/*" \
+    --exclude="cache/*" \
+    .
+```
+
+2. 设置定时备份（每天凌晨2点）：
+```bash
+# 添加到 crontab
+0 2 * * * /path/to/backup.sh
+```
+
+### 7. 更新部署
+
+1. 创建更新脚本 `update.sh`：
+```bash
+#!/bin/bash
+# 停止服务
+sudo systemctl stop autosync
+
+# 备份当前版本
+./backup.sh
+
+# 拉取最新代码
+git pull origin main
+
+# 更新依赖
+source venv/bin/activate
+pip install -r requirements.txt
+
+# 重启服务
+sudo systemctl start autosync
+```
+
+2. 执行更新：
+```bash
+bash update.sh
+``` 

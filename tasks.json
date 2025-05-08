@@ -1,32 +1,12 @@
 [
   {
-    "task_id": "1746612042",
-    "name": "sync-disk1",
-    "input_dir": "/mnt/disk1",
-    "output_dir": "/home/emby/disk1",
+    "task_id": "1746672351",
+    "name": "sync",
+    "input_dir": "/Users/wmliu/tmp/source",
+    "output_dir": "/Users/wmliu/tmp/target",
     "extensions": "jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup",
-    "status": "stopped",
-    "start_time": "2025-05-07 22:46:33",
-    "stop_time": "2025-05-07 23:18:42"
-  },
-  {
-    "task_id": "1746629673",
-    "name": "sync-disk0",
-    "input_dir": "/mnt/disk0",
-    "output_dir": "/home/emby/disk0",
-    "extensions": "jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup",
-    "status": "stopped",
-    "start_time": "2025-05-07 22:54:47",
-    "stop_time": "2025-05-07 23:18:44"
-  },
-  {
-    "task_id": "1746630084",
-    "name": "sync-disk2",
-    "input_dir": "/eds/disk2",
-    "output_dir": "/home/emby/disk2",
-    "extensions": "jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup",
-    "status": "stopped",
-    "start_time": "2025-05-07 23:12:14",
-    "stop_time": "2025-05-07 23:18:45"
+    "status": "running",
+    "start_time": "2025-05-08 15:59:56",
+    "stop_time": null
   }
 ]

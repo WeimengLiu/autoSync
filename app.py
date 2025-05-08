@@ -4,6 +4,7 @@ from task_manager import TaskManager
 import os
 from datetime import datetime
 import time
+import asyncio
 
 app = Flask(__name__)
 task_manager = TaskManager()
@@ -52,9 +53,13 @@ def sync_task(task_id):
         if not task:
             return jsonify({"success": False, "message": "任务不存在"})
         
+        # 确保logger已初始化
+        from sync_files import sync_all_files, cleanup_empty_dirs, setup_logger
+        if task.logger is None:
+            task.logger = setup_logger(verbose=True, task_id=task.task_id)
+        
         # 执行全量同步
-        from sync_files import sync_all_files, cleanup_empty_dirs
-        sync_all_files(task.input_dir, task.output_dir, task.extensions, task.logger)
+        asyncio.run(sync_all_files(task.input_dir, task.output_dir, task.extensions, task.logger))
         cleanup_empty_dirs(task.output_dir, task.logger)
         return jsonify({"success": True})
     except Exception as e:
