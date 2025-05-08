@@ -1,468 +1,600 @@
 #!/usr/bin/env python3
 import os
-import sys
-import shutil
-import argparse
-import logging
 import hashlib
 import json
+import mmap
+import logging
+import argparse
 from datetime import datetime
 from pathlib import Path
-import pyinotify
-from multiprocessing import Pool, cpu_count
-from functools import partial
+from watchdog.observers import Observer
+from watchdog.observers.fsevents import FSEventsObserver  # macOS 专用观察者
+from watchdog.events import (
+    FileSystemEventHandler,
+    FileClosedEvent,
+    FileDeletedEvent,
+    FileMovedEvent,
+    FileCreatedEvent,
+    FileModifiedEvent
+)
+from multiprocessing import Pool, cpu_count, Manager
+from functools import partial, lru_cache
+import asyncio
+import aiofiles
+from aiofiles import os as aios
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from typing import Dict, Set, Deque
+import time
+import threading
+from cache_manager import CacheManager
+import sys
 
-# 默认文件后缀列表
+# 配置常量
 DEFAULT_EXTENSIONS = "jpg,jpeg,png,gif,bmp,webp,ico,svg,nfo,srt,ass,ssa,sub,idx,smi,ssa,SRT,sup"
+BATCH_SIZE = 100
+BATCH_INTERVAL = 1.0
+LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 
-# 配置日志
-def setup_logger(task_id=None, verbose=False):
-    """设置日志记录器"""
-    # 为每个任务创建独立的logger
-    logger_name = f'FileSync_{task_id}' if task_id else 'FileSync'
-    logger = logging.getLogger(logger_name)
-    
-    # 如果logger已经有handler，直接返回
-    if logger.handlers:
-        return logger
-    
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    
-    # 创建控制台处理器
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
-    
-    # 创建文件处理器
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # 为每个任务创建独立的日志文件
-    if task_id:
-        log_file = os.path.join(log_dir, f'file_sync_{task_id}_{datetime.now().strftime("%Y%m%d")}.log')
-    else:
-        log_file = os.path.join(log_dir, f'file_sync_{datetime.now().strftime("%Y%m%d")}.log')
-        
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    file_handler.setLevel(logging.INFO)
-    
-    # 设置日志格式
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    console_handler.setFormatter(formatter)
-    file_handler.setFormatter(formatter)
-    
-    # 添加处理器
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
-    
-    return logger
+class BatchProcessor:
+    """批量处理器，用于优化文件处理性能"""
+    def __init__(self, handler, batch_size: int = BATCH_SIZE, interval: float = BATCH_INTERVAL):
+        self.handler = handler
+        self.batch_size = batch_size
+        self.interval = interval
+        self.queue: Deque = deque()
+        self.last_process_time = time.time()
+        self.processing = False
 
-class FileSyncHandler(pyinotify.ProcessEvent):
-    def __init__(self, input_dir, output_dir, extensions, logger):
-        super().__init__()
+    async def add_task(self, file_path: str, event_type: str) -> None:
+        """添加任务到队列并按需处理"""
+        self.queue.append((file_path, event_type))
+        await self.process_batch_if_needed()
+
+    async def process_batch_if_needed(self) -> None:
+        """检查并处理批次任务"""
+        current_time = time.time()
+        if (len(self.queue) >= self.batch_size or 
+            (self.queue and current_time - self.last_process_time >= self.interval)):
+            await self.process_batch()
+
+    async def process_batch(self) -> None:
+        """处理一批任务"""
+        if self.processing or not self.queue:
+            return
+
+        self.processing = True
+        try:
+            tasks = []
+            while self.queue and len(tasks) < self.batch_size:
+                file_path, event_type = self.queue.popleft()
+                tasks.append(self.handler.sync_file_async(file_path, event_type))
+
+            if tasks:
+                await asyncio.gather(*tasks)
+                self.last_process_time = time.time()
+        finally:
+            self.processing = False
+
+class FileWriteMonitor:
+    """文件写入监控器"""
+    def __init__(self, file_path: str, logger: logging.Logger, check_interval: float = 0.5, stable_duration: float = 1.0):
+        self.file_path = file_path
+        self.logger = logger
+        self.check_interval = check_interval  # 检查间隔（秒）
+        self.stable_duration = stable_duration  # 文件需要保持稳定的时间（秒）
+        self.last_size = 0
+        self.last_mtime = 0
+        self.last_stable_time = 0
+
+    async def wait_for_completion(self) -> bool:
+        """等待文件写入完成"""
+        try:
+            start_time = time.time()
+            while True:
+                if not os.path.exists(self.file_path):
+                    self.logger.debug(f"文件不存在，等待创建: {self.file_path}")
+                    await asyncio.sleep(self.check_interval)
+                    continue
+
+                current_size = os.path.getsize(self.file_path)
+                current_mtime = os.path.getmtime(self.file_path)
+                
+                # 如果文件大小和修改时间都没变化
+                if current_size == self.last_size and current_mtime == self.last_mtime:
+                    # 如果这是第一次检测到稳定
+                    if self.last_stable_time == 0:
+                        self.last_stable_time = time.time()
+                    # 如果文件已经保持稳定足够长时间
+                    elif time.time() - self.last_stable_time >= self.stable_duration:
+                        self.logger.debug(f"文件写入完成: {self.file_path} (大小: {current_size}字节)")
+                        return True
+                else:
+                    # 如果文件发生变化，重置稳定时间
+                    self.last_stable_time = 0
+                    self.logger.debug(f"文件正在写入: {self.file_path} (大小: {current_size}字节)")
+
+                self.last_size = current_size
+                self.last_mtime = current_mtime
+                
+                # 如果等待时间过长，返回False
+                if time.time() - start_time > 30:  # 最多等待30秒
+                    self.logger.warning(f"等待文件写入完成超时: {self.file_path}")
+                    return False
+                    
+                await asyncio.sleep(self.check_interval)
+        except Exception as e:
+            self.logger.error(f"监控文件写入失败: {self.file_path}, 错误: {e}")
+            return False
+
+class FileSyncHandler(FileSystemEventHandler):
+    """文件同步处理器"""
+    def __init__(self, input_dir: str, output_dir: str, extensions: str, logger: logging.Logger, task_id: str = None):
         self.input_dir = input_dir
         self.output_dir = output_dir
         self.extensions = extensions.split(',')
         self.logger = logger
-        self.processing_files = set()  # 用于跟踪正在处理的文件
-        self.md5_cache = {}  # 缓存文件的MD5值
-        self.mtime_cache = {}  # 缓存文件的修改时间
-        self.cache_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            'cache',
-            f'sync_cache_{hashlib.md5(input_dir.encode()).hexdigest()}.json'
-        )
-        self.load_cache()
-        self.logger.info("初始化 FileSyncHandler，监控目录: %s", input_dir)
+        self.processing_files: Set[str] = set()
+        self.event_loop = asyncio.new_event_loop()
+        self.batch_processor = BatchProcessor(self)
+        self.symlink_processed: Set[str] = set()  # 记录已处理的软链接
+        self.write_monitors: Dict[str, asyncio.Task] = {}  # 文件写入监控任务
+        
+        # 初始化缓存管理器
+        self.task_id = task_id or hashlib.md5(os.path.abspath(input_dir).encode()).hexdigest()
+        self.cache_manager = CacheManager(self.task_id, logger)
 
-    def load_cache(self):
-        """从磁盘加载缓存"""
-        try:
-            # 确保缓存目录存在
-            cache_dir = os.path.dirname(self.cache_file)
-            os.makedirs(cache_dir, exist_ok=True)
-            
-            if os.path.exists(self.cache_file):
-                with open(self.cache_file, 'r', encoding='utf-8') as f:
-                    cache_data = json.load(f)
-                    self.md5_cache = cache_data.get('md5_cache', {})
-                    self.mtime_cache = cache_data.get('mtime_cache', {})
-                self.logger.info("已加载缓存文件: %s", self.cache_file)
-                self.logger.debug("缓存包含 %d 个文件记录", len(self.md5_cache))
-            else:
-                self.logger.info("缓存文件不存在，将创建新缓存: %s", self.cache_file)
-        except Exception as e:
-            self.logger.error("加载缓存失败: %s", str(e))
-            self.md5_cache = {}
-            self.mtime_cache = {}
-
-    def save_cache(self):
-        """将缓存保存到磁盘"""
-        try:
-            # 确保缓存目录存在
-            cache_dir = os.path.dirname(self.cache_file)
-            os.makedirs(cache_dir, exist_ok=True)
-            
-            # 保存缓存数据
-            cache_data = {
-                'md5_cache': self.md5_cache,
-                'mtime_cache': self.mtime_cache,
-                'last_update': datetime.now().isoformat()
-            }
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, ensure_ascii=False, indent=2)
-            self.logger.debug("缓存已保存到: %s", self.cache_file)
-        except Exception as e:
-            self.logger.error("保存缓存失败: %s", str(e))
-
-    def clear_cache(self):
-        """清理缓存"""
-        self.md5_cache.clear()
-        self.mtime_cache.clear()
-        try:
-            if os.path.exists(self.cache_file):
-                os.remove(self.cache_file)
-                self.logger.info("缓存文件已删除: %s", self.cache_file)
-        except Exception as e:
-            self.logger.error("删除缓存文件失败: %s", str(e))
-
-    def check_extension(self, file_path):
-        """检查文件是否在需要复制的后缀列表中"""
+    @lru_cache(maxsize=1000)
+    def check_extension(self, file_path: str) -> bool:
+        """检查文件扩展名（带缓存）"""
         return any(file_path.lower().endswith(ext.lower()) for ext in self.extensions)
 
-    def get_output_path(self, input_path):
-        """获取输出文件路径"""
-        rel_path = os.path.relpath(input_path, self.input_dir)
-        return os.path.join(self.output_dir, rel_path)
+    @lru_cache(maxsize=1000)
+    def get_output_path(self, input_path: str) -> str:
+        """获取输出路径（带缓存）"""
+        return str(Path(self.output_dir) / Path(input_path).relative_to(self.input_dir))
 
-    def is_valid_symlink(self, link_path, target_path):
-        """检查软链接是否有效且指向正确的目标"""
+    async def get_file_md5_async(self, file_path: str) -> str:
+        """异步计算文件MD5（带缓存和mmap优化）"""
         try:
-            return os.path.islink(link_path) and os.path.realpath(link_path) == os.path.realpath(target_path)
-        except Exception:
-            return False
-
-    def get_file_md5(self, file_path):
-        """计算文件的MD5哈希值，使用缓存机制"""
-        try:
-            # 获取文件的修改时间
             mtime = os.path.getmtime(file_path)
             
-            # 如果文件在缓存中且修改时间未变，直接返回缓存的MD5值
-            if file_path in self.md5_cache and self.mtime_cache.get(file_path) == mtime:
-                return self.md5_cache[file_path]
-            
-            # 计算新的MD5值
+            # 检查缓存
+            cached_md5, cached_mtime = self.cache_manager.get_cache(file_path)
+            if cached_md5 and cached_mtime == mtime:
+                #self.logger.debug(f"使用缓存的MD5: {file_path}")
+                return cached_md5
+
+            self.logger.debug(f"计算文件MD5: {file_path}")
+            file_size = os.path.getsize(file_path)
             md5_hash = hashlib.md5()
-            with open(file_path, 'rb') as f:
-                for chunk in iter(lambda: f.read(8192), b''):
-                    md5_hash.update(chunk)
+
+            if file_size >= LARGE_FILE_THRESHOLD:
+                with open(file_path, 'rb') as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        md5_hash.update(mm)
+            else:
+                async with aiofiles.open(file_path, 'rb') as f:
+                    while chunk := await f.read(8192):
+                        md5_hash.update(chunk)
+
             md5_value = md5_hash.hexdigest()
             
             # 更新缓存
-            self.md5_cache[file_path] = md5_value
-            self.mtime_cache[file_path] = mtime
-            
-            # 定期保存缓存（这里设置为每更新10个文件保存一次）
-            if len(self.md5_cache) % 10 == 0:
-                self.save_cache()
+            self.cache_manager.update_cache(file_path, md5_value, mtime)
             
             return md5_value
         except Exception as e:
-            self.logger.error("计算MD5失败: %s, 错误: %s", file_path, str(e))
+            self.logger.error(f"计算MD5失败: {file_path}, 错误: {e}")
             return None
 
-    def files_are_identical(self, file1, file2):
-        """检查两个文件是否完全相同，使用缓存机制"""
-        try:
-            # 首先比较文件大小
-            if os.path.getsize(file1) != os.path.getsize(file2):
-                return False
-            
-            # 获取两个文件的修改时间
-            mtime1 = os.path.getmtime(file1)
-            mtime2 = os.path.getmtime(file2)
-            
-            # 如果两个文件都在缓存中且修改时间未变，直接比较缓存的MD5值
-            if (file1 in self.md5_cache and self.mtime_cache.get(file1) == mtime1 and
-                file2 in self.md5_cache and self.mtime_cache.get(file2) == mtime2):
-                self.logger.debug("使用缓存比较文件: %s 和 %s", file1, file2)
-                return self.md5_cache[file1] == self.md5_cache[file2]
-            
-            # 计算并比较MD5值
-            md5_1 = self.get_file_md5(file1)
-            md5_2 = self.get_file_md5(file2)
-            return md5_1 is not None and md5_2 is not None and md5_1 == md5_2
-        except Exception as e:
-            self.logger.error("比较文件失败: %s 和 %s, 错误: %s", file1, file2, str(e))
-            return False
-
-    def sync_file(self, input_path, event_type):
-        """同步单个文件"""
-        if not os.path.isfile(input_path):
-            return
-
-        # 如果文件正在处理中，跳过
+    async def sync_file_async(self, input_path: str, event_type: str) -> None:
+        """异步同步单个文件"""
         if input_path in self.processing_files:
             return
 
+        self.processing_files.add(input_path)
         try:
-            self.processing_files.add(input_path)
-            output_path = self.get_output_path(input_path)
-            output_dir = os.path.dirname(output_path)
+            if not Path(input_path).exists():
+                return
 
-            # 创建输出目录
-            os.makedirs(output_dir, exist_ok=True)
+            output_path = self.get_output_path(input_path)
+            await aios.makedirs(os.path.dirname(output_path), exist_ok=True)
 
             if self.check_extension(input_path):
-                # 复制文件
-                if os.path.exists(output_path):
-                    if self.files_are_identical(input_path, output_path):
-                        return
-                self.logger.info("复制文件: %s", os.path.relpath(input_path, self.input_dir))
-                shutil.copy2(input_path, output_path)
+                # 处理需要复制的文件
+                try:
+                    # 获取源文件的MD5和大小
+                    source_size = os.path.getsize(input_path)
+                    source_md5 = await self.get_file_md5_async(input_path)
+                    if source_md5 is None:
+                        raise Exception("无法计算源文件MD5")
+
+                    # 如果目标文件已存在，检查是否需要更新
+                    if Path(output_path).exists():
+                        target_size = os.path.getsize(output_path)
+                        if target_size == source_size:
+                            target_md5 = await self.get_file_md5_async(output_path)
+                            if target_md5 == source_md5:
+                                return
+
+                    # 开始复制文件
+                    temp_output_path = output_path + '.tmp'
+                    try:
+                        async with aiofiles.open(input_path, 'rb') as fsrc:
+                            async with aiofiles.open(temp_output_path, 'wb') as fdst:
+                                await fdst.write(await fsrc.read())
+
+                        # 验证复制后的文件，不使用缓存
+                        temp_size = os.path.getsize(temp_output_path)
+                        # 直接计算临时文件的 MD5，不使用缓存
+                        temp_md5_hash = hashlib.md5()
+                        with open(temp_output_path, 'rb') as f:
+                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                                temp_md5_hash.update(mm)
+                        temp_md5 = temp_md5_hash.hexdigest()
+                        
+                        if temp_size != source_size or temp_md5 != source_md5:
+                            raise Exception("文件复制验证失败")
+
+                        if os.path.exists(output_path):
+                            os.remove(output_path)
+                        os.rename(temp_output_path, output_path)
+                        # 更新目标文件的MD5缓存
+                        self.cache_manager.update_cache(output_path, temp_md5, os.path.getmtime(output_path))
+                        # 只在复制完成后输出一次日志
+                        if event_type == "write_complete":
+                            self.logger.info(f"[完成] {Path(input_path).relative_to(self.input_dir)}")
+                        else:
+                            self.logger.info(f"[复制] {Path(input_path).relative_to(self.input_dir)}")
+
+                    except Exception as e:
+                        if os.path.exists(temp_output_path):
+                            os.remove(temp_output_path)
+                        raise e
+
+                except Exception as e:
+                    self.logger.error(f"[错误] {Path(input_path).relative_to(self.input_dir)}: {e}")
+
             else:
-                # 创建软链接
+                # 处理需要创建软链接的文件
                 if os.path.exists(output_path):
-                    if self.is_valid_symlink(output_path, input_path):
-                        return
-                    else:
-                        os.remove(output_path)
-                self.logger.info("创建软链接: %s", os.path.relpath(input_path, self.input_dir))
+                    if os.path.islink(output_path):
+                        try:
+                            if os.path.samefile(os.path.realpath(output_path), input_path):
+                                return
+                        except OSError:
+                            pass
+                    os.remove(output_path)
+                
                 os.symlink(input_path, output_path)
+                self.logger.info(f"[链接] {Path(input_path).relative_to(self.input_dir)}")
+
         except Exception as e:
-            self.logger.error("同步文件失败: %s, 错误: %s", os.path.relpath(input_path, self.input_dir), str(e))
+            self.logger.error(f"[错误] {Path(input_path).relative_to(self.input_dir)}: {e}")
         finally:
             self.processing_files.remove(input_path)
 
-    def process_IN_CLOSE_WRITE(self, event):
-        """处理文件写入完成事件"""
-        if not event.dir:
-            self.sync_file(event.pathname, "CLOSE_WRITE")
-
-    def process_IN_MOVED_TO(self, event):
-        """处理文件移动到事件"""
-        if not event.dir:
-            self.sync_file(event.pathname, "MOVED_TO")
-
-    def process_IN_DELETE(self, event):
-        """处理文件删除事件"""
-        if event.dir:
-            self.logger.info("删除目录: %s", os.path.relpath(event.pathname, self.input_dir))
-            self._handle_dir_delete(event.pathname)
+    def dispatch(self, event):
+        """重写 dispatch 方法以处理文件系统事件"""
+        # 检查路径是否在监控目录内
+        if hasattr(event, 'dest_path'):  # 移动事件
+            paths = [event.src_path, event.dest_path]
         else:
-            self.logger.info("删除文件: %s", os.path.relpath(event.pathname, self.input_dir))
-            self._handle_delete(event.pathname)
-
-    def process_IN_MOVED_FROM(self, event):
-        """处理文件移出事件（相当于删除）"""
-        if event.dir:
-            self.logger.info("删除目录(移出): %s", os.path.relpath(event.pathname, self.input_dir))
-            self._handle_dir_delete(event.pathname)
-        else:
-            self.logger.info("删除文件(移出): %s", os.path.relpath(event.pathname, self.input_dir))
-            self._handle_delete(event.pathname)
-
-    def process_IN_DELETE_SELF(self, event):
-        """处理文件自身被删除事件"""
-        if event.dir:
-            self.logger.info("删除目录(自身): %s", os.path.relpath(event.pathname, self.input_dir))
-            self._handle_dir_delete(event.pathname)
-        else:
-            self.logger.info("删除文件(自身): %s", os.path.relpath(event.pathname, self.input_dir))
-            self._handle_delete(event.pathname)
-
-    def _handle_dir_delete(self, pathname):
-        """统一处理目录删除逻辑"""
-        output_path = self.get_output_path(pathname)
+            paths = [event.src_path]
         
-        if os.path.exists(output_path):
-            try:
-                shutil.rmtree(output_path)
-            except Exception as e:
-                self.logger.error("删除目录失败: %s, 错误: %s", os.path.relpath(pathname, self.input_dir), str(e))
+        valid_paths = [p for p in paths if p.startswith(self.input_dir)]
+        if not valid_paths or event.is_directory:
+            return
 
-    def _handle_delete(self, pathname):
-        """统一处理文件删除逻辑"""
-        output_path = self.get_output_path(pathname)
+        try:
+            # 处理删除事件
+            if isinstance(event, FileDeletedEvent):
+                self._cancel_write_monitor(event.src_path)
+                self.on_deleted(event)
+                self.symlink_processed.discard(event.src_path)
+                return
+
+            # 处理复制文件的创建/修改事件
+            if self.check_extension(event.src_path):
+                if isinstance(event, (FileCreatedEvent, FileModifiedEvent)):
+                    self._handle_file_change(event.src_path)
+            # 处理软链接文件
+            elif isinstance(event, FileCreatedEvent):
+                if event.src_path not in self.symlink_processed:
+                    self.on_symlink_update(event)
+                    self.symlink_processed.add(event.src_path)
+            
+            # 处理移动事件
+            if isinstance(event, FileMovedEvent):
+                self._cancel_write_monitor(event.src_path)
+                self.on_moved(event)
+                self.symlink_processed.discard(event.src_path)
+                if not self.check_extension(event.dest_path):
+                    self.symlink_processed.add(event.dest_path)
+                self.logger.info(f"[移动] {Path(event.src_path).relative_to(self.input_dir)} -> {Path(event.dest_path).relative_to(self.input_dir)}")
+
+        except Exception as e:
+            self.logger.error(f"[错误] {Path(event.src_path).relative_to(self.input_dir)}: {e}")
+
+    def _handle_file_change(self, file_path: str):
+        """处理文件变化事件"""
+        # 如果已经有监控任务在运行，先取消它
+        if file_path in self.write_monitors:
+            self._cancel_write_monitor(file_path)
         
-        if os.path.lexists(output_path):
-            try:
-                os.remove(output_path)
-            except Exception as e:
-                self.logger.error("删除文件失败: %s, 错误: %s", os.path.relpath(pathname, self.input_dir), str(e))
+        # 创建新的监控任务
+        async def monitor_and_sync():
+            monitor = FileWriteMonitor(file_path, self.logger)
+            if await monitor.wait_for_completion():
+                await self.batch_processor.add_task(file_path, "write_complete")
+            else:
+                self.logger.warning(f"[超时] {Path(file_path).relative_to(self.input_dir)}")
 
-    def process_default(self, event):
-        """处理其他类型的事件"""
-        pass
+        task = asyncio.run_coroutine_threadsafe(monitor_and_sync(), self.event_loop)
+        self.write_monitors[file_path] = task
 
-def sync_single_file(handler, file_info):
-    """同步单个文件（用于多进程处理）"""
-    input_path, rel_path = file_info
-    try:
-        # 获取输出文件路径
-        output_path = os.path.join(handler.output_dir, rel_path)
-        
-        # 如果输出文件存在且修改时间相同，跳过同步
-        if (os.path.exists(output_path) and 
-            os.path.getmtime(output_path) == os.path.getmtime(input_path) and
-            os.path.getsize(input_path) == os.path.getsize(output_path)):
-            return {'status': 'skipped', 'file': rel_path}
-        
-        # 创建输出目录
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    def _cancel_write_monitor(self, file_path: str):
+        """取消文件的写入监控任务"""
+        if file_path in self.write_monitors:
+            task = self.write_monitors.pop(file_path)
+            task.cancel()
 
-        if handler.check_extension(input_path):
-            # 复制文件
-            shutil.copy2(input_path, output_path)
-        else:
-            # 创建软链接
+    def on_closed(self, event):
+        """处理需要复制的文件的写入完成事件"""
+        if not Path(event.src_path).exists():
+            return
+        self._run_async_task(self.batch_processor.add_task(event.src_path, "write_complete"))
+
+    def on_symlink_update(self, event):
+        """处理需要创建软链接的文件的创建事件"""
+        if not Path(event.src_path).exists():
+            return
+            
+        output_path = self.get_output_path(event.src_path)
+        try:
+            # 如果目标路径已存在
             if os.path.exists(output_path):
+                if os.path.islink(output_path):
+                    try:
+                        if os.path.samefile(os.path.realpath(output_path), event.src_path):
+                            return
+                    except OSError:
+                        pass
                 os.remove(output_path)
-            os.symlink(input_path, output_path)
-        
-        return {'status': 'synced', 'file': rel_path}
-    except Exception as e:
-        return {'status': 'error', 'file': rel_path, 'error': str(e)}
-
-def sync_all_files(input_dir, output_dir, extensions, logger):
-    """全量同步所有文件（使用多进程）"""
-    logger.info("开始全量同步...")
-
-    # 创建FileSyncHandler实例
-    handler = FileSyncHandler(input_dir, output_dir, extensions, logger)
-
-    try:
-        # 收集需要同步的文件
-        files_to_sync = []
-        source_files = set()
-        
-        for root, _, files in os.walk(input_dir):
-            for file in files:
-                input_path = os.path.join(root, file)
-                rel_path = os.path.relpath(input_path, input_dir)
-                source_files.add(rel_path)
-                files_to_sync.append((input_path, rel_path))
-
-        # 确定进程数（使用CPU核心数的2倍，但不超过文件数）
-        num_processes = min(cpu_count() * 2, len(files_to_sync))
-        logger.info("使用 %d 个进程进行并行同步", num_processes)
-
-        # 创建进程池
-        with Pool(num_processes) as pool:
-            # 使用partial固定handler参数
-            sync_func = partial(sync_single_file, handler)
             
-            # 使用进程池并行处理文件
-            total_files = len(files_to_sync)
-            synced_files = 0
-            skipped_files = 0
-            error_files = 0
+            # 创建父目录
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            # 创建软链接
+            os.symlink(event.src_path, output_path)
+            # 移到这里输出日志，确保软链接创建成功后才输出
+            self.logger.info(f"[链接] {Path(event.src_path).relative_to(self.input_dir)}")
+        except Exception as e:
+            self.logger.error(f"[错误] 创建软链接失败 {Path(event.src_path).relative_to(self.input_dir)}: {e}")
+            self.symlink_processed.discard(event.src_path)
+
+    def on_deleted(self, event):
+        """处理文件删除事件"""
+        try:
+            output_path = self.get_output_path(event.src_path)
+            self.logger.debug(f"检测到删除事件，源文件: {event.src_path}")
+            self.logger.debug(f"对应的输出路径: {output_path}")
             
-            # 使用imap_unordered获取实时结果
-            for result in pool.imap_unordered(sync_func, files_to_sync):
-                if result['status'] == 'synced':
-                    synced_files += 1
-                elif result['status'] == 'skipped':
-                    skipped_files += 1
-                else:
-                    error_files += 1
-                    logger.error("同步失败: %s, 错误: %s", result['file'], result['error'])
+            if os.path.lexists(output_path):  # 使用lexists来检查软链接本身是否存在
+                try:
+                    if os.path.islink(output_path):
+                        self.logger.debug(f"删除软链接: {output_path}")
+                    else:
+                        self.logger.debug(f"删除普通文件: {output_path}")
+                    os.remove(output_path)
+                    self.logger.info(f"已删除: {Path(event.src_path).relative_to(self.input_dir)}")
+                except Exception as e:
+                    self.logger.error(f"删除文件失败 {output_path}: {e}")
+            else:
+                self.logger.debug(f"输出路径不存在，无需删除: {output_path}")
+            
+            # 清理空目录
+            output_dir = os.path.dirname(output_path)
+            try:
+                while output_dir and output_dir.startswith(self.output_dir):
+                    if not os.listdir(output_dir):
+                        os.rmdir(output_dir)
+                        self.logger.debug(f"删除空目录: {output_dir}")
+                        output_dir = os.path.dirname(output_dir)
+                    else:
+                        break
+            except Exception as e:
+                self.logger.debug(f"清理空目录失败: {e}")
+        except Exception as e:
+            self.logger.error(f"处理删除事件失败: {e}")
 
-                # 显示进度
-                if (synced_files + skipped_files) % 100 == 0 or (synced_files + skipped_files) == total_files:
-                    progress = (synced_files + skipped_files) / total_files * 100
-                    logger.info("同步进度: %.1f%% (%d/%d)", progress, synced_files + skipped_files, total_files)
+    def on_moved(self, event):
+        """处理文件移动事件"""
+        self.on_deleted(event)  # 处理源文件的删除
+        if Path(event.dest_path).exists():
+            if self.check_extension(event.dest_path):
+                # 对于需要复制的文件，等待文件写入完成
+                self._run_async_task(self.batch_processor.add_task(event.dest_path, "moved"))
+            else:
+                # 对于需要创建软链接的文件，立即处理
+                self.on_symlink_update(event)
 
-        # 检查并删除不存在的文件
-        removed_files = 0
-        for root, _, files in os.walk(output_dir):
-            for file in files:
-                output_path = os.path.join(root, file)
-                rel_path = os.path.relpath(output_path, output_dir)
-                
-                if rel_path not in source_files:
+    def _run_async_task(self, coro):
+        """在事件循环中运行异步任务"""
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self.event_loop)
+            future.result()  # 等待任务完成
+        except Exception as e:
+            self.logger.error(f"运行异步任务失败: {e}")
+
+    def __del__(self):
+        """清理资源"""
+        # 取消所有监控任务
+        for task in self.write_monitors.values():
+            task.cancel()
+        self.write_monitors.clear()
+        
+        # 关闭事件循环
+        if hasattr(self, 'event_loop') and self.event_loop.is_running():
+            self.event_loop.stop()
+            self.event_loop.close()
+
+async def check_and_handle_existing_symlinks(output_dir: str, input_dir: str, logger: logging.Logger) -> None:
+    """检查并处理现有的软链接"""
+    logger.info("[开始] 检查现有软链接")
+    invalid_count = 0
+    valid_count = 0
+    
+    for root, _, files in os.walk(output_dir):
+        for file in files:
+            output_path = os.path.join(root, file)
+            if os.path.islink(output_path):
+                try:
+                    # 获取软链接的目标路径
+                    target_path = os.path.realpath(output_path)
+                    # 检查软链接是否有效
+                    if not os.path.exists(target_path) or not target_path.startswith(input_dir):
+                        os.remove(output_path)
+                        invalid_count += 1
+                        logger.info(f"[清理] 无效链接: {Path(output_path).relative_to(output_dir)} -> {target_path}")
+                    else:
+                        valid_count += 1
+                except OSError as e:
                     try:
                         os.remove(output_path)
-                        removed_files += 1
-                    except Exception as e:
-                        logger.error("删除文件失败: %s, 错误: %s", rel_path, str(e))
+                        invalid_count += 1
+                        logger.info(f"[清理] 损坏链接: {Path(output_path).relative_to(output_dir)}")
+                    except OSError as e2:
+                        logger.error(f"[错误] 无法删除损坏链接 {Path(output_path).relative_to(output_dir)}: {e2}")
 
-        # 同步完成后保存缓存
-        handler.save_cache()
-        
-        # 输出同步统计信息
-        logger.info("\n同步完成:")
-        logger.info("- 总文件数: %d", total_files)
-        logger.info("- 已同步: %d", synced_files)
-        logger.info("- 已跳过: %d", skipped_files)
-        logger.info("- 已删除: %d", removed_files)
-        if error_files > 0:
-            logger.error("- 同步失败: %d", error_files)
+    logger.info(f"[完成] 链接检查: 有效 {valid_count} 个, 清理 {invalid_count} 个")
 
-    except Exception as e:
-        logger.error("同步过程出错: %s", str(e))
-        handler.save_cache()
-        raise
+async def sync_all_files(input_dir: str, output_dir: str, extensions: str, logger: logging.Logger, task_id: str = None) -> None:
+    handler = FileSyncHandler(input_dir, output_dir, extensions, logger, task_id)
+    logger.info(f"[开始] 全量同步: {input_dir} -> {output_dir}")
+    
+    # 收集所有输出目录中的软链接
+    output_symlinks = set()
+    for root, _, files in os.walk(output_dir):
+        for file in files:
+            output_path = os.path.join(root, file)
+            if os.path.islink(output_path):
+                output_symlinks.add(output_path)
+    
+    # 统计需要处理的文件数量
+    total_files = sum(len(files) for _, _, files in os.walk(input_dir))
+    processed_paths = set()
+    processed_files = 0
+    
+    # 同步文件并处理软链接
+    for root, _, files in os.walk(input_dir):
+        for file in files:
+            input_path = os.path.join(root, file)
+            output_path = handler.get_output_path(input_path)
+            processed_paths.add(output_path)
+            
+            try:
+                await handler.sync_file_async(input_path, "initial")
+                processed_files += 1
+                if processed_files % 10 == 0:
+                    logger.info(f"[进度] {processed_files}/{total_files} ({processed_files/total_files*100:.1f}%)")
+            except Exception as e:
+                logger.error(f"[错误] {Path(input_path).relative_to(input_dir)}: {e}")
+    
+    logger.info(f"[完成] 全量同步，共处理 {processed_files} 个文件")
 
-def cleanup_empty_dirs(output_dir, logger):
+def cleanup_empty_dirs(directory: str, logger: logging.Logger) -> None:
     """清理空目录"""
-    for root, dirs, _ in os.walk(output_dir, topdown=False):
+    for root, dirs, files in os.walk(directory, topdown=False):
         for dir_name in dirs:
             dir_path = os.path.join(root, dir_name)
-            if not os.listdir(dir_path):
-                try:
+            try:
+                if not os.listdir(dir_path):  # 检查目录是否为空
                     os.rmdir(dir_path)
-                except Exception as e:
-                    logger.error("删除空目录失败: %s, 错误: %s", dir_path, str(e))
+                    logger.info(f"已删除空目录: {dir_path}")
+            except Exception as e:
+                logger.error(f"删除空目录失败 {dir_path}: {e}")
+
+def setup_logger(verbose: bool = False, task_id: str = None) -> logging.Logger:
+    """配置日志记录器"""
+    logger_name = f'FileSync_{task_id}' if task_id else 'FileSync'
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.DEBUG)  # 总是设置为DEBUG级别以捕获所有日志
+
+    if not logger.handlers:
+        # 控制台处理器
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.DEBUG)  # 控制台只显示INFO及以上级别
+        console_formatter = logging.Formatter('%(message)s')  # 控制台使用简单格式
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+
+        # 文件处理器
+        log_dir = Path(__file__).parent / 'logs'
+        log_dir.mkdir(exist_ok=True)
+        
+        # 使用年月日作为日志文件名
+        if task_id:
+            file_name = f'file_sync_{task_id}_{datetime.now():%Y%m%d}.log'
+        else:
+            file_name = f'file_sync_{datetime.now():%Y%m%d}.log'
+            
+        file_handler = logging.FileHandler(
+            log_dir / file_name,
+            encoding='utf-8'
+        )
+        file_handler.setLevel(logging.DEBUG)  # 文件记录所有级别的日志
+        
+        # 文件日志使用详细格式
+        file_formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - [%(name)s] - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+
+        # 如果是调试模式，控制台也显示DEBUG级别的日志
+        if verbose:
+            console_handler.setFormatter(file_formatter)  # 使用详细格式
+
+    return logger
 
 def main():
-    parser = argparse.ArgumentParser(description='文件同步工具')
+    """主函数"""
+    parser = argparse.ArgumentParser(description='文件自动同步工具')
     parser.add_argument('input_dir', help='输入目录')
     parser.add_argument('output_dir', help='输出目录')
-    parser.add_argument('-e', '--extensions', default=DEFAULT_EXTENSIONS,
-                      help=f'文件后缀名（用逗号分隔，默认: {DEFAULT_EXTENSIONS}）')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                      help='显示详细输出')
+    parser.add_argument('--extensions', default=DEFAULT_EXTENSIONS, help='要同步的文件后缀，用逗号分隔')
+    parser.add_argument('--verbose', action='store_true', help='显示详细日志')
+    parser.add_argument('--batch-size', type=int, default=BATCH_SIZE, help='批处理大小')
+    parser.add_argument('--batch-interval', type=float, default=BATCH_INTERVAL, help='批处理间隔（秒）')
     args = parser.parse_args()
 
-    # 设置日志记录器
     logger = setup_logger(args.verbose)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    # 检查输入目录是否存在
-    if not os.path.isdir(args.input_dir):
-        logger.error("错误: 输入目录 '%s' 不存在", args.input_dir)
-        sys.exit(1)
+    # 执行初始同步
+    logger.info("开始全量同步...")
+    asyncio.run(sync_all_files(args.input_dir, args.output_dir, args.extensions, logger))
+    logger.info("全量同步完成")
 
-    # 创建输出目录
-    os.makedirs(args.output_dir, exist_ok=True)
+    # 启动文件监控，使用FSEventsObserver来支持文件关闭事件
+    if sys.platform == 'darwin':  # macOS
+        observer = FSEventsObserver()
+    else:  # 其他平台
+        observer = Observer()
+        logger.warning("当前平台不支持文件关闭事件监听，将使用修改事件代替")
 
-    logger.info("配置信息:")
-    logger.info("输入目录: %s", args.input_dir)
-    logger.info("输出目录: %s", args.output_dir)
-    logger.info("文件后缀: %s", args.extensions)
-    logger.info("详细模式: %s", "开启" if args.verbose else "关闭")
-    logger.info("")
-
-    # 初始全量同步
-    sync_all_files(args.input_dir, args.output_dir, args.extensions, logger)
-    cleanup_empty_dirs(args.output_dir, logger)
-
-    # 设置文件监控
-    wm = pyinotify.WatchManager()
-    handler = FileSyncHandler(args.input_dir, args.output_dir, args.extensions, logger)
-    notifier = pyinotify.Notifier(wm, handler)
-    
-    # 添加监控，只监控指定的事件
-    mask = pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO | pyinotify.IN_DELETE
-    wm.add_watch(args.input_dir, mask, rec=True, auto_add=True)
-
-    logger.info("开始监控目录变化...")
+    event_handler = FileSyncHandler(args.input_dir, args.output_dir, args.extensions, logger)
+    observer.schedule(event_handler, args.input_dir, recursive=True)
+    observer.start()
 
     try:
-        notifier.loop()
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        notifier.stop()
-        logger.info("停止监控")
+        observer.stop()
+    observer.join()
 
 if __name__ == '__main__':
     main() 
