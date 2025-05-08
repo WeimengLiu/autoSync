@@ -44,6 +44,22 @@ def remove_task(task_id):
     success = task_manager.remove_task(task_id)
     return jsonify({"success": success})
 
+@app.route('/api/tasks/<task_id>/sync', methods=['POST'])
+def sync_task(task_id):
+    """执行全量同步"""
+    try:
+        task = task_manager.get_task(task_id)
+        if not task:
+            return jsonify({"success": False, "message": "任务不存在"})
+        
+        # 执行全量同步
+        from sync_files import sync_all_files, cleanup_empty_dirs
+        sync_all_files(task.input_dir, task.output_dir, task.extensions, task.logger)
+        cleanup_empty_dirs(task.output_dir, task.logger)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
 @app.route('/api/tasks/<task_id>/start', methods=['POST'])
 def start_task(task_id):
     """启动任务"""
@@ -118,11 +134,14 @@ def get_log_dates(task_id):
         return jsonify({"dates": []})
 
     dates = []
+    prefix = f'file_sync_{task_id}_'
     for filename in os.listdir(log_dir):
-        if filename.startswith('file_sync_') and filename.endswith('.log'):
-            date_str = filename[10:18]  # 提取日期部分
-            dates.append(date_str)
-            print(f"找到日志文件: {filename}, 日期: {date_str}")
+        if filename.startswith(prefix) and filename.endswith('.log'):
+            # 从文件名中提取日期部分
+            date_str = filename[len(prefix):-4]  # 去掉前缀和.log后缀
+            if len(date_str) == 8 and date_str.isdigit():  # 确保日期格式正确
+                dates.append(date_str)
+                print(f"找到日志文件: {filename}, 日期: {date_str}")
 
     # 按日期降序排序
     dates.sort(reverse=True)

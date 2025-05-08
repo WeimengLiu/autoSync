@@ -41,6 +41,7 @@ config.json
 .pytest_cache/
 .coverage
 htmlcov/
+cache/
 
 # 临时文件
 *.tmp

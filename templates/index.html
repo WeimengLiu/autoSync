@@ -20,13 +20,15 @@
             box-shadow: 0 4px 8px rgba(0,0,0,0.2);
         }
         .log-container {
-            height: 400px;
+            height: 70vh;
             overflow-y: auto;
             background-color: #1e1e1e;
             color: #fff;
             padding: 1rem;
             font-family: 'Consolas', monospace;
             border-radius: 4px;
+            padding-right: 20px;
+            box-sizing: border-box;
         }
         .status-badge {
             font-size: 0.9rem;
@@ -68,6 +70,35 @@
         }
         .task-info strong {
             color: #495057;
+        }
+        .log-container::-webkit-scrollbar {
+            width: 12px;
+            height: 12px;
+        }
+        
+        .log-container::-webkit-scrollbar-track {
+            background: #2d2d2d;
+            border-radius: 6px;
+        }
+        
+        .log-container::-webkit-scrollbar-thumb {
+            background: #666;
+            border-radius: 6px;
+            border: 2px solid #2d2d2d;
+        }
+        
+        .log-container::-webkit-scrollbar-thumb:hover {
+            background: #888;
+        }
+
+        .log-container::-webkit-scrollbar-corner {
+            background: #2d2d2d;
+        }
+
+        .log-content {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            padding-right: 8px;
         }
     </style>
 </head>
@@ -168,11 +199,11 @@
 
         <!-- 日志模态框 -->
         <div class="modal fade" id="logModal" tabindex="-1">
-            <div class="modal-dialog modal-lg">
+            <div class="modal-dialog modal-xl" style="max-width: 90%;">
                 <div class="modal-content">
                     <div class="modal-header">
                         <h5 class="modal-title"><i class="bi bi-journal-text"></i> 任务日志</h5>
-                        <div class="ms-auto">
+                        <div class="ms-auto me-2">
                             <select id="logDateSelect" class="form-select form-select-sm" style="width: 150px;">
                                 <option value="">加载中...</option>
                             </select>
@@ -180,7 +211,9 @@
                         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
                     <div class="modal-body">
-                        <div id="logContainer" class="log-container"></div>
+                        <div id="logContainer" class="log-container">
+                            <div class="log-content"></div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -232,6 +265,9 @@
                                     <i class="bi bi-play-circle"></i> 启动
                                    </button>`
                             }
+                            <button class="btn btn-primary" onclick="syncTask('${task.task_id}')">
+                                <i class="bi bi-arrow-repeat"></i> 立即执行
+                            </button>
                             <button class="btn btn-info" onclick="showLogs('${task.task_id}')">
                                 <i class="bi bi-journal-text"></i> 查看日志
                             </button>
@@ -533,9 +569,49 @@
             fetch(`/api/tasks/${taskId}/logs?date=${date}`)
                 .then(response => response.json())
                 .then(data => {
-                    logContainer.innerHTML = data.logs.join('<br>');
+                    logContainer.innerHTML = `<div class="log-content">${data.logs.join('')}</div>`;
                     logContainer.scrollTop = logContainer.scrollHeight;
                 });
+        }
+
+        // 立即执行全量同步
+        function syncTask(taskId) {
+            const card = document.querySelector(`.card[data-task-id="${taskId}"]`);
+            if (!card) {
+                console.error('找不到任务卡片:', taskId);
+                return;
+            }
+            const syncBtn = card.querySelector('.btn-primary');
+            
+            if (!syncBtn) {
+                console.error('找不到同步按钮:', taskId);
+                return;
+            }
+
+            // 禁用按钮并显示加载状态
+            syncBtn.disabled = true;
+            syncBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 同步中...';
+
+            fetch(`/api/tasks/${taskId}/sync`, {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert('全量同步执行成功');
+                } else {
+                    alert('全量同步执行失败: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('全量同步执行失败');
+            })
+            .finally(() => {
+                // 恢复按钮状态
+                syncBtn.disabled = false;
+                syncBtn.innerHTML = '<i class="bi bi-arrow-repeat"></i> 立即执行';
+            });
         }
 
         // 定期刷新任务列表
