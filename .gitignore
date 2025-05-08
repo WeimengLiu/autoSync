@@ -50,5 +50,5 @@ cache/
 *.swp
 *~ 
 
-.db
+.db/
 *.db
